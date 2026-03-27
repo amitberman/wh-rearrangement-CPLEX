@@ -52,3 +52,10 @@ benchmarks
 
 # mip log
 mip.log
+
+# CMake
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
