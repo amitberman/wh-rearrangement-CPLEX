@@ -1,0 +1,16 @@
+{
+     "configurations": [
+       {
+         "name": "Linux",
+         "includePath": [
+           "${workspaceFolder}/**",
+           "/home/nir.miller/or-tools_x86_64_rockylinux-9_cpp_v9.12.4544/include"
+         ],
+         "compilerPath": "/usr/bin/g++",
+         "cStandard": "c17",
+         "cppStandard": "c++20",
+         "intelliSenseMode": "linux-gcc-x64"
+       }
+     ],
+     "version": 4
+   }
