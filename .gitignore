@@ -55,6 +55,8 @@ mip.log
 
 # CMake
 build/
+build_cplex/
+build_ortools/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
