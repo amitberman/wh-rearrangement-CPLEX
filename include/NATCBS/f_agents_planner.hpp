@@ -88,8 +88,11 @@ private:
     unordered_map<NodeIndex, NodeIndex> commit_edges_d_to_s;
     unordered_set<ArcIndex> deleted_arcs;
 
-    unordered_map<int, array<int, 3>> makespan_graph_params;
+#ifdef FLOW_BACKEND_ORTOOLS
     unordered_map<int, vector<ArcIndex>> makespan_to_arc_permutation;
+#endif
+
+    unordered_map<int, array<int, 3>> makespan_graph_params;
 
     NodeIndex get_node_idx(const FlowNode &node);
     ArcIndex get_arc_idx(NodeIndex tail, NodeIndex head);
@@ -103,9 +106,11 @@ private:
     void update_sources_and_sinks(const vector<shared_ptr<Constraints>> &constraints_table);
 
     Result solve_flow();
+
 #ifdef FLOW_BACKEND_ORTOOLS
     ArcIndex PermutedArc(ArcIndex arc) const;
 #endif
+
     void print_flow();
 
 public:
