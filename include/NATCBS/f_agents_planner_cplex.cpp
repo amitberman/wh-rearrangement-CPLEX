@@ -32,19 +32,17 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
         throw std::runtime_error("CPLEX solve_flow: graph has no nodes.");
     }
 
-    // Same augmented-network idea as OR-Tools path:
-    // - add total_source and total_sink
-    // - add commit helper arcs:
-    //      total_source -> supply_node
-    //      demand_node  -> total_sink
-    // - add global arcs:
-    //      total_source -> source_idx
-    //      sink_idx     -> total_sink
+    // Same augmented-network structure as the OR-Tools path.
     const ArcIndex commit_arc_count = static_cast<ArcIndex>(commit_edges_d_to_s.size());
     const ArcIndex augmented_num_arcs = num_arcs + 2 * commit_arc_count + 2;
     const NodeIndex total_source = num_nodes;
     const NodeIndex total_sink = num_nodes + 1;
     const NodeIndex augmented_num_nodes = num_nodes + 2;
+
+    // Required flow in the augmented network.
+    maximum_flow = static_cast<FlowQuantity>(
+        num_of_agents + static_cast<int>(commit_edges_d_to_s.size())
+    );
 
     std::vector<int> fromnode;
     std::vector<int> tonode;
@@ -59,50 +57,70 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
     up.reserve(static_cast<size_t>(augmented_num_arcs));
     obj.reserve(static_cast<size_t>(augmented_num_arcs));
 
-    // Original planning arcs.
+    // ---------------------------------------------------------------------
+    // Original planner arcs
+    //
+    // LOWER-BOUND HANDLING:
+    // Here we explicitly pass lower bounds to CPLEX via low[].
+    // In the current planner data structure, original arcs are still modeled
+    // with lower bound 0 and upper bound arc_cap[a].
+    // So for these arcs:
+    //      low[a] = 0
+    //      up[a]  = arc_cap[a]
+    // ---------------------------------------------------------------------
     for (ArcIndex a = 0; a < num_arcs; ++a) {
         fromnode.push_back(static_cast<int>(arc_tail[a]));
         tonode.push_back(static_cast<int>(arc_head[a]));
-        low.push_back(0.0);
-        up.push_back(static_cast<double>(arc_cap[a]));
+        low.push_back(0.0);                                  // <-- lower bound used here
+        up.push_back(static_cast<double>(arc_cap[a]));      // <-- upper bound used here
         obj.push_back(static_cast<double>(arc_cost[a]));
     }
 
-    // Commit helper arcs.
+    // ---------------------------------------------------------------------
+    // LOWER-BOUND HANDLING:
+    // These helper arcs represent mandatory commit flow.
+    // We model that explicitly with:
+    //      1 <= x <= 1
+    // lower bound = upper bound = 1.
+    // ---------------------------------------------------------------------
     for (const auto &[demand_node, supply_node] : commit_edges_d_to_s) {
         fromnode.push_back(static_cast<int>(total_source));
         tonode.push_back(static_cast<int>(supply_node));
-        low.push_back(0.0);
-        up.push_back(static_cast<double>(CAP));
+        low.push_back(1.0);                                 // <-- lower bound used here
+        up.push_back(1.0);                                  // <-- upper bound used here
         obj.push_back(0.0);
 
         fromnode.push_back(static_cast<int>(demand_node));
         tonode.push_back(static_cast<int>(total_sink));
-        low.push_back(0.0);
-        up.push_back(static_cast<double>(CAP));
+        low.push_back(1.0);                                 // <-- lower bound used here
+        up.push_back(1.0);                                  // <-- upper bound used here
         obj.push_back(0.0);
     }
 
-    // Global source/sink coupling arcs.
+    // ---------------------------------------------------------------------
+    // Global source/sink coupling arcs
+    //
+    // LOWER-BOUND HANDLING:
+    // We force exactly num_of_agents units through the main source/sink
+    // coupling by setting:
+    //      num_of_agents <= x <= num_of_agents
+    // Again, lower bounds are passed directly to CPLEX.
+    // ---------------------------------------------------------------------
     fromnode.push_back(static_cast<int>(total_source));
     tonode.push_back(static_cast<int>(source_idx));
-    low.push_back(0.0);
-    up.push_back(static_cast<double>(num_of_agents));
+    low.push_back(static_cast<double>(num_of_agents));      // <-- lower bound used here
+    up.push_back(static_cast<double>(num_of_agents));       // <-- upper bound used here
     obj.push_back(0.0);
 
     fromnode.push_back(static_cast<int>(sink_idx));
     tonode.push_back(static_cast<int>(total_sink));
-    low.push_back(0.0);
-    up.push_back(static_cast<double>(num_of_agents));
+    low.push_back(static_cast<double>(num_of_agents));      // <-- lower bound used here
+    up.push_back(static_cast<double>(num_of_agents));       // <-- upper bound used here
     obj.push_back(0.0);
 
-    // Required total flow:
-    // all agents + all commit helper obligations.
-    const FlowQuantity required_flow =
-        static_cast<FlowQuantity>(num_of_agents + static_cast<int>(commit_edges_d_to_s.size()));
-
-    supply[static_cast<size_t>(total_source)] = static_cast<double>(required_flow);
-    supply[static_cast<size_t>(total_sink)] = -static_cast<double>(required_flow);
+    // Node supplies on augmented network.
+    supply[static_cast<size_t>(total_source)] = static_cast<double>(maximum_flow);
+    supply[static_cast<size_t>(total_sink)] = -static_cast<double>(maximum_flow);
 
     CPXENVptr env = nullptr;
     CPXNETptr net = nullptr;
@@ -119,6 +137,14 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
             throw_cplex_error(env, status, "CPXNETcreateprob");
         }
 
+        // -----------------------------------------------------------------
+        // LOWER-BOUND HANDLING:
+        // This is the core place where CPLEX takes lower bounds into account.
+        // We pass both:
+        //      low.data()  -> arc lower bounds
+        //      up.data()   -> arc upper bounds
+        // directly into CPXNETcopynet(...).
+        // -----------------------------------------------------------------
         status = CPXNETcopynet(
             env,
             net,
@@ -132,7 +158,7 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
             low.data(),
             up.data(),
             obj.data(),
-            nullptr  // arc names
+            nullptr       // arc names
         );
         if (status != 0) {
             throw_cplex_error(env, status, "CPXNETcopynet");
@@ -157,7 +183,6 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
         }
 
         optimal_cost = static_cast<CostValue>(std::llround(objval));
-        maximum_flow = required_flow;
 
         std::vector<double> x(static_cast<size_t>(augmented_num_arcs), 0.0);
         status = CPXNETgetx(env, net, x.data(), 0, static_cast<int>(augmented_num_arcs) - 1);
@@ -165,12 +190,14 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
             throw_cplex_error(env, status, "CPXNETgetx");
         }
 
-        // Only the original arcs are relevant downstream.
+        // Only original planner arcs are used downstream for path extraction.
         arc_flow.assign(static_cast<size_t>(num_arcs), 0);
         flow.clear();
 
         for (ArcIndex a = 0; a < num_arcs; ++a) {
-            const FlowQuantity f = static_cast<FlowQuantity>(std::llround(x[static_cast<size_t>(a)]));
+            const FlowQuantity f = static_cast<FlowQuantity>(
+                std::llround(x[static_cast<size_t>(a)])
+            );
             arc_flow[static_cast<size_t>(a)] = f;
 
             if (f > 0) {
