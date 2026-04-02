@@ -57,7 +57,11 @@ mip.log
 build/
 build_cplex/
 build_ortools/
+build_cplex_w_lb/
+build_cplex_wo_lb/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+
+#Build Directories
