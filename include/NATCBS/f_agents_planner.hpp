@@ -80,7 +80,9 @@ private:
     void update_graph_edge_costs(const vector<shared_ptr<TimedPath>> &obs_paths);
     void update_single_edge_cost(NodeIndex n1, NodeIndex n2, CostValue cost);
     void update_sources_and_sinks(const vector<shared_ptr<Constraints>> &constraints_table);
+    // ORTOOLS_MIGRATION: Direct OR-Tools dependency (GenericMaxFlow/GenericMinCostFlow).
     Result solve_flow();
+    // ORTOOLS_MIGRATION: Uses OR-Tools arc permutation produced by graph.Build(...).
     ArcIndex PermutedArc(ArcIndex arc) const;
     void print_flow();
 
