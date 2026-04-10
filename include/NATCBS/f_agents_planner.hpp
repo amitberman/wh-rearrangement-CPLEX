@@ -92,6 +92,58 @@ private:
     unordered_map<int, vector<ArcIndex>> makespan_to_arc_permutation;
 #endif
 
+#ifdef FLOW_BACKEND_CPLEX
+    // ===== CPLEX Warm-Start Persistent State =====
+    // These members persist across NATCBS iterations to enable warm-starting
+    // of the network simplex solver with previously computed basis information.
+    
+    // CPLEX environment pointer: reused across all flow solves
+    // Allocated on first use by ensure_cplex_model(), freed in destructor
+    CPXENVptr cplex_env = nullptr;
+    
+    // CPLEX network model pointer: persistent min-cost flow network structure
+    // Allocated on first use by ensure_cplex_model(), freed in destructor
+    CPXNETptr cplex_net = nullptr;
+    
+    // Runtime toggle: controls whether to reuse previously computed simplex basis
+    // Read from environment variable MAWR_CPLEX_WARM_START (default: 1)
+    // When enabled: CPXNETcopybase() injects saved basis before solving
+    // When disabled: solver starts from scratch (cold-start)
+    bool cplex_warm_start_enabled = true;
+    
+    // Runtime toggle: controls whether to reuse and update the persistent model
+    // Read from environment variable MAWR_CPLEX_REUSE_MODEL (default: 1)
+    // When enabled: differential updates via CPXNETchgbds()/CPXNETchgobj()
+    // When disabled: model is rebuilt via CPXNETcopynet() on every iteration
+    bool cplex_reuse_model_enabled = true;
+    
+    // Saved network simplex basis from previous iteration
+    // saved_arc_basis[a] = CPX status code for arc a (basic, lower bound, upper bound)
+    // saved_node_basis[n] = CPX status code for node n (basic, free, or at bound)
+    vector<int> saved_arc_basis;
+    vector<int> saved_node_basis;
+    
+    // Dimensions of saved basis: validate compatibility before warm-start injection
+    int saved_basis_arc_count = -1;
+    int saved_basis_node_count = -1;
+    
+    // Topology fingerprint: detects when network structure changes
+    // Used for topology_unchanged check: if fromnode/tonode unchanged,
+    // can apply differential updates; otherwise must rebuild model
+    vector<int> prev_fromnode;
+    vector<int> prev_tonode;
+    
+    // Previous augmented network dimensions: used to detect topology changes
+    int prev_augmented_node_count = -1;
+    int prev_augmented_arc_count = -1;
+
+    // Lazy initialization: ensures CPLEX environment and network model are created
+    void ensure_cplex_model();
+    
+    // Reset basis state: called when topology changes or solve fails
+    void clear_saved_basis();
+#endif
+
     unordered_map<int, array<int, 3>> makespan_graph_params;
 
     NodeIndex get_node_idx(const FlowNode &node);
@@ -120,6 +172,7 @@ public:
     FAgentsPlanner(int map_rows, int map_cols, const vector<vector<CellType>> &map,
                    vector<Location> &agent_start_locations,
                    int num_of_tasks, bool verbose);
+    ~FAgentsPlanner();
 
     Result find_paths(const vector<shared_ptr<TimedPath>> &obs_paths,
                       const vector<shared_ptr<Constraints>> &constraints_table,
