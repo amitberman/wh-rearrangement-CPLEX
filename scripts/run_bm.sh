@@ -1,15 +1,53 @@
 #!/usr/bin/env bash
 set -u
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <root_directory>"
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "Usage: $0 <root_directory> [cplex_mode]"
+    echo ""
+    echo "cplex_mode options:"
+    echo "  cplex-warm        (default) MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=1"
+    echo "  cplex-reuse-only            MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=1"
+    echo "  cplex-basis-only            MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=0"
+    echo "  cplex-cold                  MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=0"
     exit 1
 fi
 
 ROOT_DIR="$1"
+CPLEX_MODE="${2:-cplex-warm}"
 
 ORTOOLS_BIN="./build_ortools/MAWR"
 CPLEX_BIN="./build_cplex/MAWR"
+
+CPLEX_WARM_START="1"
+CPLEX_REUSE_MODEL="1"
+CPLEX_MODEL_LABEL="CPLEX warm"
+
+case "$CPLEX_MODE" in
+    cplex-warm)
+        CPLEX_WARM_START="1"
+        CPLEX_REUSE_MODEL="1"
+        CPLEX_MODEL_LABEL="CPLEX warm"
+        ;;
+    cplex-reuse-only)
+        CPLEX_WARM_START="0"
+        CPLEX_REUSE_MODEL="1"
+        CPLEX_MODEL_LABEL="CPLEX reuse-only"
+        ;;
+    cplex-basis-only)
+        CPLEX_WARM_START="1"
+        CPLEX_REUSE_MODEL="0"
+        CPLEX_MODEL_LABEL="CPLEX basis-only"
+        ;;
+    cplex-cold)
+        CPLEX_WARM_START="0"
+        CPLEX_REUSE_MODEL="0"
+        CPLEX_MODEL_LABEL="CPLEX cold"
+        ;;
+    *)
+        echo "Error: unknown cplex_mode '$CPLEX_MODE'"
+        exit 1
+        ;;
+esac
 
 OUT_MD="benchmark_results.md"
 TMP_LOG="$(mktemp)"
@@ -51,14 +89,25 @@ run_one() {
     local bin="$1"
     local map_file="$2"
     local scen="$3"
+    local cplex_run="$4"
 
-    "$bin" \
-        -m "$map_file" \
-        -s "$scen" \
-        -a NATCBS \
-        -t 60 \
-        -o results.csv \
-        --v 2 > "$TMP_LOG" 2>&1
+    if [[ "$cplex_run" == "1" ]]; then
+        MAWR_CPLEX_WARM_START="$CPLEX_WARM_START" MAWR_CPLEX_REUSE_MODEL="$CPLEX_REUSE_MODEL" "$bin" \
+            -m "$map_file" \
+            -s "$scen" \
+            -a NATCBS \
+            -t 60 \
+            -o results.csv \
+            --v 2 > "$TMP_LOG" 2>&1
+    else
+        "$bin" \
+            -m "$map_file" \
+            -s "$scen" \
+            -a NATCBS \
+            -t 60 \
+            -o results.csv \
+            --v 2 > "$TMP_LOG" 2>&1
+    fi
 
     local exit_code=$?
 
@@ -114,8 +163,9 @@ match_status() {
     echo
     echo "- Root directory: \`$ROOT_DIR\`"
     echo "- Total scenarios: $TOTAL_SCENS"
+    echo "- CPLEX mode: $CPLEX_MODEL_LABEL (MAWR_CPLEX_WARM_START=$CPLEX_WARM_START, MAWR_CPLEX_REUSE_MODEL=$CPLEX_REUSE_MODEL)"
     echo
-    echo "| Dataset | Scenario | Cost Match | Makespan Match | Time (OR) | Time (CPLEX) | Speedup OR/CPLEX |"
+    echo "| Dataset | Scenario | Cost Match | Makespan Match | Time (OR) | Time ($CPLEX_MODEL_LABEL) | Speedup OR/$CPLEX_MODEL_LABEL |"
     echo "|---|---|---|---|---:|---:|---:|"
 } > "$OUT_MD"
 
@@ -133,11 +183,11 @@ for scen in "${SCEN_FILES[@]}"; do
 
     MAP_FILE="${MAP_FILES[0]}"
 
-    or_res="$(run_one "$ORTOOLS_BIN" "$MAP_FILE" "$scen")"
+    or_res="$(run_one "$ORTOOLS_BIN" "$MAP_FILE" "$scen" 0)"
     CURRENT_RUN=$((CURRENT_RUN + 1))
     progress_bar "$CURRENT_RUN" "$TOTAL_RUNS"
 
-    cplex_res="$(run_one "$CPLEX_BIN" "$MAP_FILE" "$scen")"
+    cplex_res="$(run_one "$CPLEX_BIN" "$MAP_FILE" "$scen" 1)"
     CURRENT_RUN=$((CURRENT_RUN + 1))
     progress_bar "$CURRENT_RUN" "$TOTAL_RUNS"
 

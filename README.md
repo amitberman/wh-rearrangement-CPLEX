@@ -77,6 +77,44 @@ build_cplex/
 
 Use identical inputs for fair benchmarking.
 
+### OR-Tools vs CPLEX Mode Benchmark (`scripts/run_bm.sh`)
+
+`run_bm.sh` compares OR-Tools (`build_ortools/MAWR`) against CPLEX (`build_cplex/MAWR`) and writes `benchmark_results.md`.
+
+Usage:
+
+```bash
+bash scripts/run_bm.sh <root_directory> [cplex_mode]
+```
+
+Examples:
+
+```bash
+# Default mode (same as cplex-warm)
+bash scripts/run_bm.sh wh
+
+# Explicit warm-start mode
+bash scripts/run_bm.sh wh cplex-warm
+
+# Model reuse only (no basis warm-start)
+bash scripts/run_bm.sh wh cplex-reuse-only
+
+# Basis warm-start only (no model reuse)
+bash scripts/run_bm.sh wh cplex-basis-only
+
+# Full cold-start baseline
+bash scripts/run_bm.sh wh cplex-cold
+```
+
+Available `cplex_mode` values:
+
+- `cplex-warm` -> `MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=1`
+- `cplex-reuse-only` -> `MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=1`
+- `cplex-basis-only` -> `MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=0`
+- `cplex-cold` -> `MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=0`
+
+The result table header is generated dynamically and reflects the selected CPLEX model label.
+
 ---
 
 # Warm-Start (CPLEX NATCBS Iterations)
@@ -106,8 +144,6 @@ These two environment variables control different aspects of warm-start and can 
 
 ### `MAWR_CPLEX_WARM_START` (default: 1)
 
-**What it controls:** Whether to reuse the previously computed **simplex basis** from the last iteration.
-
 **When enabled (=1):**
 - After each successful min-cost flow solve, extract and save the optimal simplex basis (arc and node statuses)
 - On the next iteration, if topology is unchanged, **inject the saved basis** via `CPXNETcopybase()` before solving
@@ -126,8 +162,6 @@ These two environment variables control different aspects of warm-start and can 
 
 ### `MAWR_CPLEX_REUSE_MODEL` (default: 1)
 
-**What it controls:** Whether to reuse and incrementally update the persistent **network model** structure across iterations.
-
 **When enabled (=1):**
 - First iteration: create CPLEX environment and network model via `CPXNETcreateprob()`
 - Subsequent iterations:
@@ -141,21 +175,6 @@ These two environment variables control different aspects of warm-start and can 
 - Reverts to original behavior: stateless per-iteration solves
 - Higher overhead due to repeated allocation/deallocation
 - Basis warm-start is ineffective (basis from one ephemeral model doesn't transfer to next)
-
-**Performance impact:** Model reuse provides ~10-30% speedup depending on solver overhead relative to problem size.
-
----
-
-## Recommended Configurations
-
-| Configuration | Warm-Start Basis? | Model Reuse? | Behavior | Use Case |
-|--- |---|---|---|---|
-| `=1, =1` (default) | ✓ | ✓ | **Full warm-start:** fast differential updates + basis injection | Iterative solving (NATCBS with changing topology) |
-| `=1, =0` | ✓ | ✗ | Basis reused across ephemeral models (less effective) | Debugging; model rebuild cost not dominant |
-| `=0, =1` | ✗ | ✓ | Model reused but cold-start each time | Topology changes frequently; basis less valuable |
-| `=0, =0` | ✗ | ✗ | **Full cold-start:** rebuild + no basis reuse | Baseline comparison; one-off solves |
-
----
 
 ## Usage Examples
 
@@ -189,7 +208,53 @@ Debug signals in verbose mode (`--v 2`):
 
 # Warm-Start Performance Evaluation
 
-Run warm-start vs cold-start comparison on a sequence of scenarios:
+## Build Steps (Warm-Start Benchmark Setup)
+
+Build OR-Tools binary:
+
+```bash
+cmake -S . -B build_ortools \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFLOW_BACKEND=ORTOOLS \
+  -DCMAKE_PREFIX_PATH="$HOME/or-tools_x86_64_rockylinux-9_cpp_v9.12.4544;$HOME/or-tools_x86_64_rockylinux-9_cpp_v9.12.4544/lib64/cmake"
+
+cmake --build build_ortools -j
+```
+
+Build CPLEX binary:
+
+```bash
+cmake -S . -B build_cplex \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFLOW_BACKEND=CPLEX \
+  -DCPLEX_ROOT=$HOME/cplex2212
+
+cmake --build build_cplex -j
+```
+
+## Run Benchmarks
+
+Warm-start vs OR-Tools (new benchmark table with dynamic model columns):
+
+```bash
+bash scripts/run_bm.sh wh cplex-warm
+```
+
+Other OR-Tools vs CPLEX mode comparisons:
+
+```bash
+bash scripts/run_bm.sh wh cplex-reuse-only
+bash scripts/run_bm.sh wh cplex-basis-only
+bash scripts/run_bm.sh wh cplex-cold
+```
+
+Output file:
+
+- `benchmark_results.md`
+
+Warm-start vs cold-start (CPLEX-only A/B, CSV output):
+
+## Run warm-start vs cold-start comparison on a sequence of scenarios:
 
 bash scripts/benchmark_warmstart.sh wh
 
