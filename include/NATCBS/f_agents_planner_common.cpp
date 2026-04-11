@@ -1,5 +1,7 @@
 #include "f_agents_planner.hpp"
 
+#include <cstdlib>
+
 FAgentsPlanner::FAgentsPlanner(int map_rows, int map_cols, const vector<vector<CellType>> &map,
                          vector<Location> &agent_start_locations, int num_of_tasks, bool verbose) :
         map_rows(map_rows), map_cols(map_cols), map(map), num_of_agents(static_cast<int>(agent_start_locations.size())),
@@ -18,6 +20,40 @@ FAgentsPlanner::FAgentsPlanner(int map_rows, int map_cols, const vector<vector<C
         reached_locations.emplace_back(agent_start_locations[i]);
         new_reached_locations.insert(agent_start_locations[i]);
     }
+
+#ifdef FLOW_BACKEND_CPLEX
+    // ===== CPLEX Warm-Start Configuration (from environment variables) =====
+    // MAWR_CPLEX_WARM_START: controls whether to reuse the simplex basis from previous iteration
+    // - When set to 1 (default): CPXNETcopybase() loads saved basis before each solve
+    // - When set to 0: solver ignores saved basis and performs cold-start
+    // - Used in solve_flow() to determine if basis warm-start can be applied
+    if (const char *warm_start_env = std::getenv("MAWR_CPLEX_WARM_START")) {
+        cplex_warm_start_enabled = std::atoi(warm_start_env) != 0;
+    }
+    
+    // MAWR_CPLEX_REUSE_MODEL: controls whether to reuse and incrementally update the model
+    // - When set to 1 (default): persistent model is updated via CPXNETchgbds/chgobj (differential updates)
+    // - When set to 0: model is discarded and rebuilt via CPXNETcopynet on every iteration
+    // - Combined with MAWR_CPLEX_WARM_START=1, achieves maximum warm-start benefit
+    // - Setting to 0 disables incremental updates (reverts to per-iteration rebuild)
+    if (const char *reuse_env = std::getenv("MAWR_CPLEX_REUSE_MODEL")) {
+        cplex_reuse_model_enabled = std::atoi(reuse_env) != 0;
+    }
+#endif
+}
+
+FAgentsPlanner::~FAgentsPlanner() {
+#ifdef FLOW_BACKEND_CPLEX
+    // ===== Destructor: Clean up persistent CPLEX resources =====
+    // Must free network model before closing environment
+    if (cplex_net != nullptr) {
+        CPXNETfreeprob(cplex_env, &cplex_net);
+    }
+    // Then close the CPLEX environment
+    if (cplex_env != nullptr) {
+        CPXcloseCPLEX(&cplex_env);
+    }
+#endif
 }
 
 FAgentsPlanner::NodeIndex FAgentsPlanner::get_node_idx(const FlowNode &node) {

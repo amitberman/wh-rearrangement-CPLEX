@@ -77,3 +77,204 @@ build_cplex/
 
 Use identical inputs for fair benchmarking.
 
+### OR-Tools vs CPLEX Mode Benchmark (`scripts/run_bm.sh`)
+
+`run_bm.sh` compares OR-Tools (`build_ortools/MAWR`) against CPLEX (`build_cplex/MAWR`) and writes `benchmark_results.md`.
+
+Usage:
+
+```bash
+bash scripts/run_bm.sh <root_directory> [cplex_mode]
+```
+
+Examples:
+
+```bash
+# Default mode (same as cplex-warm)
+bash scripts/run_bm.sh wh
+
+# Explicit warm-start mode
+bash scripts/run_bm.sh wh cplex-warm
+
+# Model reuse only (no basis warm-start)
+bash scripts/run_bm.sh wh cplex-reuse-only
+
+# Basis warm-start only (no model reuse)
+bash scripts/run_bm.sh wh cplex-basis-only
+
+# Full cold-start baseline
+bash scripts/run_bm.sh wh cplex-cold
+```
+
+Available `cplex_mode` values:
+
+- `cplex-warm` -> `MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=1`
+- `cplex-reuse-only` -> `MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=1`
+- `cplex-basis-only` -> `MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=0`
+- `cplex-cold` -> `MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=0`
+
+The result table header is generated dynamically and reflects the selected CPLEX model label.
+
+---
+
+# Warm-Start (CPLEX NATCBS Iterations)
+
+Warm-start is implemented in the CPLEX flow backend for NATCBS iterative solves.
+
+What is persisted across NATCBS flow solves:
+
+- CPLEX environment (`CPXENVptr`)
+- CPLEX network model (`CPXNETptr`)
+- Network simplex basis (`CPXNETgetbase` / `CPXNETcopybase`)
+
+Differential update policy (when network topology is unchanged):
+
+- Arc capacity changes are applied via bounds update (`CPXNETchgbds`), including "remove arc" behavior with upper bound = `0`.
+- Arc weight changes are applied via objective updates (`CPXNETchgobj`).
+
+Fallback behavior:
+
+- If network topology changes (node/arc incidence differs), the model is rebuilt via `CPXNETcopynet` and warm-start basis is reset.
+
+---
+
+## Runtime Toggles: `MAWR_CPLEX_WARM_START` vs `MAWR_CPLEX_REUSE_MODEL`
+
+These two environment variables control different aspects of warm-start and can be combined:
+
+### `MAWR_CPLEX_WARM_START` (default: 1)
+
+**When enabled (=1):**
+- After each successful min-cost flow solve, extract and save the optimal simplex basis (arc and node statuses)
+- On the next iteration, if topology is unchanged, **inject the saved basis** via `CPXNETcopybase()` before solving
+- Simplex algorithm uses this basis as a starting point → faster convergence (warm-start behavior)
+- Output signal: `[CPLEX] Warm start basis loaded.`
+
+**When disabled (=0):**
+- Basis is never saved or reused
+- Simplex always starts from scratch (cold-start behavior)
+- Network model can still be reused (faster than cold-start single-solve)
+- Output signal: `[CPLEX] No reusable basis available; cold start.`
+
+**Performance impact:** Basis warm-start typically provides ~1-10% speedup depending on how much the flow network structure changes between iterations.
+
+---
+
+### `MAWR_CPLEX_REUSE_MODEL` (default: 1)
+
+**When enabled (=1):**
+- First iteration: create CPLEX environment and network model via `CPXNETcreateprob()`
+- Subsequent iterations:
+  - If topology unchanged: apply fast **differential updates** via `CPXNETchgbds()` (bounds) and `CPXNETchgobj()` (costs)
+  - If topology changed: rebuild entire model via `CPXNETcopynet()`
+- Avoids repeated model creation overhead
+- Output signal: `[CPLEX] Applied differential update (bounds/objective).` or `[CPLEX] Rebuilt network model (topology changed).`
+
+**When disabled (=0):**
+- Model is discarded and rebuilt via `CPXNETcopynet()` on every iteration
+- Reverts to original behavior: stateless per-iteration solves
+- Higher overhead due to repeated allocation/deallocation
+- Basis warm-start is ineffective (basis from one ephemeral model doesn't transfer to next)
+
+## Usage Examples
+
+The default configuration enables both warm-start basis and model reuse for maximum performance:
+
+```bash
+# Full warm-start (recommended for NATCBS iterations)
+MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=1 ./build_cplex/MAWR -m <map> -s <scenario> -a NATCBS -t 60 -o results.csv --v 2
+```
+
+Other configurations for comparison:
+
+```bash
+# Model reuse only (no basis reuse)
+MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=1 ./build_cplex/MAWR -m <map> -s <scenario> -a NATCBS -t 60 -o results.csv --v 2
+
+# Basis warm-start only (model rebuilt each iteration)
+MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=0 ./build_cplex/MAWR -m <map> -s <scenario> -a NATCBS -t 60 -o results.csv --v 2
+
+# Full cold-start baseline (for comparison)
+MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=0 ./build_cplex/MAWR -m <map> -s <scenario> -a NATCBS -t 60 -o results.csv --v 2
+```
+
+Debug signals in verbose mode (`--v 2`):
+
+- `[CPLEX] Warm start basis loaded.` — Basis successfully injected before solve
+- `[CPLEX] Applied differential update (bounds/objective).` — Bounds/costs updated without rebuild
+- `[CPLEX] Rebuilt network model (topology changed).` — Network structure changed; full model rebuild occurred
+
+---
+
+# Warm-Start Performance Evaluation
+
+## Build Steps (Warm-Start Benchmark Setup)
+
+Build OR-Tools binary:
+
+```bash
+cmake -S . -B build_ortools \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFLOW_BACKEND=ORTOOLS \
+  -DCMAKE_PREFIX_PATH="$HOME/or-tools_x86_64_rockylinux-9_cpp_v9.12.4544;$HOME/or-tools_x86_64_rockylinux-9_cpp_v9.12.4544/lib64/cmake"
+
+cmake --build build_ortools -j
+```
+
+Build CPLEX binary:
+
+```bash
+cmake -S . -B build_cplex \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFLOW_BACKEND=CPLEX \
+  -DCPLEX_ROOT=$HOME/cplex2212
+
+cmake --build build_cplex -j
+```
+
+## Run Benchmarks
+
+Warm-start vs OR-Tools (new benchmark table with dynamic model columns):
+
+```bash
+bash scripts/run_bm.sh wh cplex-warm
+```
+
+Other OR-Tools vs CPLEX mode comparisons:
+
+```bash
+bash scripts/run_bm.sh wh cplex-reuse-only
+bash scripts/run_bm.sh wh cplex-basis-only
+bash scripts/run_bm.sh wh cplex-cold
+```
+
+Output file:
+
+- `benchmark_results.md`
+
+Warm-start vs cold-start (CPLEX-only A/B, CSV output):
+
+## Run warm-start vs cold-start comparison on a sequence of scenarios:
+
+bash scripts/benchmark_warmstart.sh wh
+
+Example with explicit timeout, full scenario sweep, and custom output file:
+
+bash scripts/benchmark_warmstart.sh wh 60 0 warmstart_results_after_patch.csv
+
+Optional arguments:
+
+bash scripts/benchmark_warmstart.sh <root_directory> [timeout_sec=60] [max_scenarios=0] [out_csv=warmstart_results.csv]
+
+Output CSV columns (`warmstart_results.csv`):
+
+- `warm_time_sec`, `cold_time_sec`, `cold_over_warm`
+- `warm_basis_loads` (how often basis was reused)
+- `warm_diff_updates`, `warm_rebuilds`
+- `warm_rebuild_ratio` (proxy for magnitude of structural network changes)
+
+Interpretation:
+
+- Higher `cold_over_warm` means warm-start is helping.
+- Lower `warm_rebuild_ratio` means more iterations used differential updates and are more likely to benefit from warm-start.
+
