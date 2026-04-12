@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 4 ]]; then
-    echo "Usage: $0 <root_directory> [timeout_sec=60] [max_scenarios=0] [out_csv=warmstart_results.csv]"
+if [[ $# -lt 1 || $# -gt 5 ]]; then
+    echo "Usage: $0 <root_directory> [timeout_sec=60] [max_scenarios=0] [out_csv=warmstart_results.csv] [cold_mode=reuse|full]"
     exit 1
 fi
 
@@ -10,6 +10,20 @@ ROOT_DIR="$1"
 TIMEOUT_SEC="${2:-60}"
 MAX_SCENARIOS="${3:-0}"
 OUT_CSV="${4:-warmstart_results.csv}"
+COLD_MODE="${5:-reuse}"
+
+case "$COLD_MODE" in
+    reuse)
+        COLD_REUSE_MODEL=1
+        ;;
+    full)
+        COLD_REUSE_MODEL=0
+        ;;
+    *)
+        echo "Error: invalid cold_mode '$COLD_MODE' (expected 'reuse' or 'full')."
+        exit 1
+        ;;
+esac
 
 BIN="./build_cplex/MAWR"
 
@@ -85,7 +99,7 @@ for scen in "${SCEN_FILES[@]}"; do
         -o /tmp/mawr_warm_eval.csv \
         --v 2 > "$TMP_WARM_LOG" 2>&1 || true
 
-    MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=1 "$BIN" \
+    MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL="$COLD_REUSE_MODEL" "$BIN" \
         -m "$map_file" \
         -s "$scen" \
         -a NATCBS \

@@ -1,6 +1,7 @@
 #include "f_agents_planner.hpp"
 
 #include <cstdlib>
+#include <queue>
 
 FAgentsPlanner::FAgentsPlanner(int map_rows, int map_cols, const vector<vector<CellType>> &map,
                          vector<Location> &agent_start_locations, int num_of_tasks, bool verbose) :
@@ -19,6 +20,90 @@ FAgentsPlanner::FAgentsPlanner(int map_rows, int map_cols, const vector<vector<C
         add_arc(source_idx, idx, NO_COST);
         reached_locations.emplace_back(agent_start_locations[i]);
         new_reached_locations.insert(agent_start_locations[i]);
+    }
+
+    if (const char *full_topology_env = std::getenv("MAWR_FULL_TOPOLOGY_MODE")) {
+        full_topology_mode_enabled = std::atoi(full_topology_env) != 0;
+    }
+
+    if (full_topology_mode_enabled) {
+        full_topology_locations.reserve(map_rows * map_cols);
+        full_topology_edges.reserve(map_rows * map_cols * 2 - map_rows - map_cols);
+
+        for (int x = 0; x < map_rows; ++x) {
+            for (int y = 0; y < map_cols; ++y) {
+                if (map[x][y] == CellType::BLOCKED) {
+                    continue;
+                }
+                full_topology_locations.emplace_back(x, y);
+            }
+        }
+
+        for (int x = 0; x < map_rows; ++x) {
+            for (int y = 0; y < map_cols; ++y) {
+                if (map[x][y] == CellType::BLOCKED) {
+                    continue;
+                }
+                const Location u(x, y);
+                for (int d = 0; d < 4; ++d) {
+                    const int nx = x + dx[d];
+                    const int ny = y + dy[d];
+                    if (nx < 0 || nx >= map_rows || ny < 0 || ny >= map_cols) {
+                        continue;
+                    }
+                    if (map[nx][ny] == CellType::BLOCKED) {
+                        continue;
+                    }
+                    const Location v(nx, ny);
+                    if (u < v) {
+                        full_topology_edges.emplace_back(u, v);
+                    }
+                }
+            }
+        }
+
+        // Precompute shortest-time reachability from any agent start.
+        // In full-topology mode, we keep all arcs but set UB=0 on arcs whose
+        // tail-side move cannot be reached at the current timestep.
+        const int INF_DIST = 1e9;
+        full_topology_dist_from_starts.reserve(full_topology_locations.size());
+        for (const auto &loc : full_topology_locations) {
+            full_topology_dist_from_starts.emplace(loc, INF_DIST);
+        }
+
+        std::queue<Location> q;
+        for (const auto &start_loc : agent_start_locations) {
+            auto it = full_topology_dist_from_starts.find(start_loc);
+            if (it != full_topology_dist_from_starts.end() && it->second > 0) {
+                it->second = 0;
+                q.push(start_loc);
+            }
+        }
+
+        while (!q.empty()) {
+            const Location u = q.front();
+            q.pop();
+            const int du = full_topology_dist_from_starts.at(u);
+            for (int d = 0; d < 4; ++d) {
+                const int nx = u.x + dx[d];
+                const int ny = u.y + dy[d];
+                if (nx < 0 || nx >= map_rows || ny < 0 || ny >= map_cols) {
+                    continue;
+                }
+                if (map[nx][ny] == CellType::BLOCKED) {
+                    continue;
+                }
+                const Location v(nx, ny);
+                auto it = full_topology_dist_from_starts.find(v);
+                if (it == full_topology_dist_from_starts.end()) {
+                    continue;
+                }
+                if (it->second > du + 1) {
+                    it->second = du + 1;
+                    q.push(v);
+                }
+            }
+        }
     }
 
 #ifdef FLOW_BACKEND_CPLEX
@@ -161,6 +246,71 @@ void FAgentsPlanner::update_graph(int makespan) {
     arc_cost.resize(num_edges_before_sink);
     arc_cap.resize(num_edges_before_sink);
 
+    if (full_topology_mode_enabled) {
+        auto can_reach_by_time = [&](const Location &loc, int t) -> bool {
+            auto it = full_topology_dist_from_starts.find(loc);
+            if (it == full_topology_dist_from_starts.end()) {
+                return false;
+            }
+            return it->second <= t;
+        };
+
+        auto add_arc_with_cap = [&](NodeIndex tail, NodeIndex head, CostValue cost, bool active) {
+            this->add_arc(tail, head, cost);
+            arc_cap.back() = active ? CAP : 0;
+        };
+
+        for (int t = max_makespan + 1; t <= makespan; ++t) {
+            // v_t-1_out -> v_t_in for all passable locations.
+            for (const auto &loc : full_topology_locations) {
+                NodeIndex v_out = get_node_idx(FlowNode(FlowNode::Type::OUT, t - 1, loc));
+                NodeIndex v_in = get_node_idx(FlowNode(FlowNode::Type::IN, t, loc));
+                add_arc_with_cap(v_out, v_in, UNIT_COST, can_reach_by_time(loc, t - 1));
+            }
+
+            // Edge gadgets for all passable undirected map edges.
+            for (const auto &[loc1, loc2] : full_topology_edges) {
+                NodeIndex v_1_out = get_node_idx(FlowNode(FlowNode::Type::OUT, t - 1, loc1));
+                NodeIndex v_2_out = get_node_idx(FlowNode(FlowNode::Type::OUT, t - 1, loc2));
+
+                NodeIndex edge_in = get_node_idx(FlowNode(FlowNode::Type::EDGE_IN, t, loc1, loc2));
+                const bool loc1_active_prev = can_reach_by_time(loc1, t - 1);
+                const bool loc2_active_prev = can_reach_by_time(loc2, t - 1);
+                add_arc_with_cap(v_1_out, edge_in, NO_COST, loc1_active_prev);
+                add_arc_with_cap(v_2_out, edge_in, NO_COST, loc2_active_prev);
+
+                NodeIndex edge_out = get_node_idx(FlowNode(FlowNode::Type::EDGE_OUT, t, loc1, loc2));
+                add_arc_with_cap(edge_in, edge_out, UNIT_COST, loc1_active_prev || loc2_active_prev);
+
+                NodeIndex v_1_in = get_node_idx(FlowNode(FlowNode::Type::IN, t, loc1));
+                NodeIndex v_2_in = get_node_idx(FlowNode(FlowNode::Type::IN, t, loc2));
+
+                // edge_out -> v_1_in is used by a move that starts from loc2 at t-1.
+                add_arc_with_cap(edge_out, v_1_in, NO_COST, loc2_active_prev);
+                // edge_out -> v_2_in is used by a move that starts from loc1 at t-1.
+                add_arc_with_cap(edge_out, v_2_in, NO_COST, loc1_active_prev);
+            }
+
+            // v_t_in -> v_t_out for all passable locations.
+            for (const auto &loc : full_topology_locations) {
+                NodeIndex v_in = node_to_idx.at(FlowNode(FlowNode::Type::IN, t, loc));
+                NodeIndex v_out = get_node_idx(FlowNode(FlowNode::Type::OUT, t, loc));
+                add_arc_with_cap(v_in, v_out, NO_COST, can_reach_by_time(loc, t));
+            }
+        }
+
+        // v_T_out -> sink for all passable locations.
+        for (const auto &loc : full_topology_locations) {
+            NodeIndex v_out = get_node_idx(FlowNode(FlowNode::Type::OUT, makespan, loc));
+            this->add_arc_to_sink(v_out);
+            arc_cap.back() = can_reach_by_time(loc, makespan) ? CAP : 0;
+        }
+
+        current_makespan = makespan;
+        max_makespan = std::max(max_makespan, makespan);
+        return;
+    }
+
     for (int t = max_makespan + 1; t <= makespan; t++) {
         // v_t-1_out -> v_t_in
         for (auto &loc : reached_locations) {
@@ -255,10 +405,12 @@ void FAgentsPlanner::update_single_edge_cost(NodeIndex tail, NodeIndex head, Cos
 
 void FAgentsPlanner::update_sources_and_sinks(const vector<shared_ptr<Constraints>> &constraints_table) {
     commit_edges_d_to_s.clear();
+#ifdef FLOW_BACKEND_ORTOOLS
     for (auto &e : deleted_arcs) {
         arc_cap[e] = CAP;
     }
     deleted_arcs.clear();
+#endif
 
     for (auto &constraints : constraints_table) {
         for (auto &[t, edge] : constraints->get_positive_edge_constraints()) {
@@ -267,11 +419,13 @@ void FAgentsPlanner::update_sources_and_sinks(const vector<shared_ptr<Constraint
             NodeIndex v_to_in = node_to_idx.at(FlowNode(FlowNode::Type::IN, t + 1, edge.second));
             commit_edges_d_to_s.emplace(v_from_out, v_to_in);
 
+#ifdef FLOW_BACKEND_ORTOOLS
             std::pair edge_pair = (edge.first < edge.second) ? edge : std::make_pair(edge.second, edge.first);
             ArcIndex arc = get_arc_idx(node_to_idx.at(FlowNode(FlowNode::Type::EDGE_IN, t + 1, edge_pair.first, edge_pair.second)),
                                        node_to_idx.at(FlowNode(FlowNode::Type::EDGE_OUT, t + 1, edge_pair.first, edge_pair.second)));
             arc_cap[arc] = 0;
             deleted_arcs.emplace(arc);
+#endif
         }
     }
 }
