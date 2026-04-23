@@ -19,16 +19,15 @@ namespace {
     throw std::runtime_error(where + " failed with status " + std::to_string(status));
 }
 
-} // namespace
+} 
 
 void FAgentsPlanner::clear_saved_basis() {
-    // ===== Reset Warm-Start Basis State =====
+    // Reset Warm-Start Basis State 
     // Called when:
     // 1. Network topology changes (can't reuse basis with different structure)
     // 2. Basis injection fails (CPXNETcopybase returns error)
     // 3. Solve fails (can't trust basis from failed solve)
     // 4. On exception (cleanup persistent state)
-    // 
     // This ensures only valid bases are attempted in next iteration
     saved_arc_basis.clear();
     saved_node_basis.clear();
@@ -37,12 +36,11 @@ void FAgentsPlanner::clear_saved_basis() {
 }
 
 void FAgentsPlanner::ensure_cplex_model() {
-    // ===== Lazy Initialization of Persistent CPLEX Resources =====
+    // Lazy Initialization of Persistent CPLEX Resources
     // This method implements a "warm-start model" pattern:
     // - On first call: create CPLEX environment and network model
     // - On subsequent calls: reuse existing environment and model
-    // - Avoids per-iteration allocation/cleanup overhead
-    
+    // - Avoids per-iteration allocation/cleanup overhea
     // Create CPLEX environment if not already created
     // The environment is a singleton for this planner instance
     if (cplex_env == nullptr) {
@@ -53,8 +51,6 @@ void FAgentsPlanner::ensure_cplex_model() {
         }
     }
 
-    // Create network model (min-cost flow problem) if not already created
-    // This model will be reused (with bounds/costs/basis updates) across iterations
     if (cplex_net == nullptr) {
         int status = 0;
         cplex_net = CPXNETcreateprob(cplex_env, &status, "wrp_flow_twostage");
@@ -230,7 +226,7 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
                 saved_node_basis.data()
             );
             if (status != 0) {
-                // Basis injection failed; discard and fall back to cold-start
+                // Basis injection failed, need to discard and fall back to cold-start
                 clear_saved_basis();
                 if (verbose) {
                     std::cout << "[CPLEX] Warm start basis rejected; fallback to cold start." << std::endl;
