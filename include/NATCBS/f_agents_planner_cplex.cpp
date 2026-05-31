@@ -19,16 +19,15 @@ namespace {
     throw std::runtime_error(where + " failed with status " + std::to_string(status));
 }
 
-} // namespace
+} 
 
 void FAgentsPlanner::clear_saved_basis() {
-    // ===== Reset Warm-Start Basis State =====
+    // Reset Warm-Start Basis State 
     // Called when:
     // 1. Network topology changes (can't reuse basis with different structure)
     // 2. Basis injection fails (CPXNETcopybase returns error)
     // 3. Solve fails (can't trust basis from failed solve)
     // 4. On exception (cleanup persistent state)
-    // 
     // This ensures only valid bases are attempted in next iteration
     saved_arc_basis.clear();
     saved_node_basis.clear();
@@ -37,12 +36,11 @@ void FAgentsPlanner::clear_saved_basis() {
 }
 
 void FAgentsPlanner::ensure_cplex_model() {
-    // ===== Lazy Initialization of Persistent CPLEX Resources =====
+    // Lazy Initialization of Persistent CPLEX Resources
     // This method implements a "warm-start model" pattern:
     // - On first call: create CPLEX environment and network model
     // - On subsequent calls: reuse existing environment and model
-    // - Avoids per-iteration allocation/cleanup overhead
-    
+    // - Avoids per-iteration allocation/cleanup overhea
     // Create CPLEX environment if not already created
     // The environment is a singleton for this planner instance
     if (cplex_env == nullptr) {
@@ -53,8 +51,6 @@ void FAgentsPlanner::ensure_cplex_model() {
         }
     }
 
-    // Create network model (min-cost flow problem) if not already created
-    // This model will be reused (with bounds/costs/basis updates) across iterations
     if (cplex_net == nullptr) {
         int status = 0;
         cplex_net = CPXNETcreateprob(cplex_env, &status, "wrp_flow_twostage");
@@ -76,191 +72,116 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
         throw std::runtime_error("CPLEX solve_flow: graph has no nodes.");
     }
 
-    // Same augmented network structure as the OR-Tools path.
-    const ArcIndex commit_arc_count = static_cast<ArcIndex>(commit_edges_d_to_s.size());
-    const ArcIndex augmented_num_arcs = num_arcs + 2 * commit_arc_count + 2;
-    const NodeIndex total_source = num_nodes;
-    const NodeIndex total_sink = num_nodes + 1;
-    const NodeIndex augmented_num_nodes = num_nodes + 2;
-
-    const FlowQuantity required_flow =
-        static_cast<FlowQuantity>(num_of_agents + static_cast<int>(commit_edges_d_to_s.size()));
-
     std::vector<int> fromnode;
     std::vector<int> tonode;
     std::vector<double> low;
     std::vector<double> up;
     std::vector<double> obj;
     std::vector<double> zero_obj;
-    std::vector<double> supply(static_cast<size_t>(augmented_num_nodes), 0.0);
+    std::vector<double> supply(static_cast<size_t>(num_nodes), 0.0);
 
-    fromnode.reserve(static_cast<size_t>(augmented_num_arcs));
-    tonode.reserve(static_cast<size_t>(augmented_num_arcs));
-    low.reserve(static_cast<size_t>(augmented_num_arcs));
-    up.reserve(static_cast<size_t>(augmented_num_arcs));
-    obj.reserve(static_cast<size_t>(augmented_num_arcs));
+    fromnode.reserve(static_cast<size_t>(num_arcs));
+    tonode.reserve(static_cast<size_t>(num_arcs));
+    low.reserve(static_cast<size_t>(num_arcs));
+    up.reserve(static_cast<size_t>(num_arcs));
+    obj.reserve(static_cast<size_t>(num_arcs));
 
-    // ---------------------------------------------------------------------
-    // Original planner arcs
-    //
-    // LOWER-BOUND HANDLING:
-    // CPLEX takes lower bounds directly through low[] in CPXNETcopynet(...).
-    // For original planner arcs, lower bound is currently 0 and upper bound
-    // is arc_cap[a].
-    // ---------------------------------------------------------------------
     for (ArcIndex a = 0; a < num_arcs; ++a) {
         fromnode.push_back(static_cast<int>(arc_tail[a]));
         tonode.push_back(static_cast<int>(arc_head[a]));
-        low.push_back(0.0);                                  // lower bound
-        up.push_back(static_cast<double>(arc_cap[a]));      // upper bound
-        obj.push_back(static_cast<double>(arc_cost[a]));    // real optimization cost
+        low.push_back(0.0);
+        up.push_back(static_cast<double>(arc_cap[a]));
+        obj.push_back(static_cast<double>(arc_cost[a]));
     }
 
-    // Build a deterministic ordering for commit-helper arcs.
-    // Without this, unordered_map iteration order may vary across iterations,
-    // causing false topology-change detections and unnecessary model rebuilds.
-    std::vector<std::pair<NodeIndex, NodeIndex>> sorted_commit_edges;
-    sorted_commit_edges.reserve(static_cast<size_t>(commit_edges_d_to_s.size()));
-    for (const auto &[demand_node, supply_node] : commit_edges_d_to_s) {
-        sorted_commit_edges.emplace_back(demand_node, supply_node);
-    }
-    std::sort(
-        sorted_commit_edges.begin(),
-        sorted_commit_edges.end(),
-        [](const auto &lhs, const auto &rhs) {
-            if (lhs.first != rhs.first) {
-                return lhs.first < rhs.first;
-            }
-            return lhs.second < rhs.second;
+    for (const auto &[from_out_idx, to_in_idx] : commit_edges_d_to_s) {
+        const FlowNode &from_out_node = idx_to_node.at(static_cast<size_t>(from_out_idx));
+        const FlowNode &to_in_node = idx_to_node.at(static_cast<size_t>(to_in_idx));
+        if (from_out_node.type != FlowNode::Type::OUT || to_in_node.type != FlowNode::Type::IN) {
+            throw std::runtime_error("CPLEX solve_flow: malformed positive edge commitment.");
         }
-    );
 
-    // ---------------------------------------------------------------------
-    // Commit helper arcs
-    //
-    // LOWER-BOUND HANDLING:
-    // We force exactly 1 unit through each helper arc:
-    //      1 <= x <= 1
-    // ---------------------------------------------------------------------
-    for (const auto &[demand_node, supply_node] : sorted_commit_edges) {
-        fromnode.push_back(static_cast<int>(total_source));
-        tonode.push_back(static_cast<int>(supply_node));
-        low.push_back(1.0);                                 // lower bound
-        up.push_back(1.0);                                  // upper bound
-        obj.push_back(0.0);
+        const int time = from_out_node.time;
+        const std::pair<Location, Location> edge_pair =
+            (from_out_node.location1 < to_in_node.location1)
+                ? std::make_pair(from_out_node.location1, to_in_node.location1)
+                : std::make_pair(to_in_node.location1, from_out_node.location1);
 
-        fromnode.push_back(static_cast<int>(demand_node));
-        tonode.push_back(static_cast<int>(total_sink));
-        low.push_back(1.0);                                 // lower bound
-        up.push_back(1.0);                                  // upper bound
-        obj.push_back(0.0);
+        const NodeIndex edge_in = node_to_idx.at(
+            FlowNode(FlowNode::Type::EDGE_IN, time + 1, edge_pair.first, edge_pair.second)
+        );
+        const NodeIndex edge_out = node_to_idx.at(
+            FlowNode(FlowNode::Type::EDGE_OUT, time + 1, edge_pair.first, edge_pair.second)
+        );
+
+        low[static_cast<size_t>(get_arc_idx(from_out_idx, edge_in))] = 1.0;
+        low[static_cast<size_t>(get_arc_idx(edge_in, edge_out))] = 1.0;
+        low[static_cast<size_t>(get_arc_idx(edge_out, to_in_idx))] = 1.0;
     }
-
-    // ---------------------------------------------------------------------
-    // Global source/sink coupling arcs
-    //
-    // LOWER-BOUND HANDLING:
-    // We force exactly num_of_agents units through these arcs:
-    //      num_of_agents <= x <= num_of_agents
-    // ---------------------------------------------------------------------
-    fromnode.push_back(static_cast<int>(total_source));
-    tonode.push_back(static_cast<int>(source_idx));
-    low.push_back(static_cast<double>(num_of_agents));      // lower bound
-    up.push_back(static_cast<double>(num_of_agents));       // upper bound
-    obj.push_back(0.0);
-
-    fromnode.push_back(static_cast<int>(sink_idx));
-    tonode.push_back(static_cast<int>(total_sink));
-    low.push_back(static_cast<double>(num_of_agents));      // lower bound
-    up.push_back(static_cast<double>(num_of_agents));       // upper bound
-    obj.push_back(0.0);
 
     zero_obj.assign(obj.size(), 0.0);
 
-    // Node supplies on augmented network.
-    supply[static_cast<size_t>(total_source)] = static_cast<double>(required_flow);
-    supply[static_cast<size_t>(total_sink)] = -static_cast<double>(required_flow);
+    const FlowQuantity required_flow = static_cast<FlowQuantity>(num_of_agents);
+    supply[static_cast<size_t>(source_idx)] = static_cast<double>(required_flow);
+    supply[static_cast<size_t>(sink_idx)] = -static_cast<double>(required_flow);
 
     ensure_cplex_model();
     int status = 0;
 
     try {
-        // ===== TOPOLOGY DETECTION: Decide between Rebuild vs Differential Update =====
-        // The network topology (arc connectivity) can change across NATCBS iterations
-        // when new agents/barriers are discovered. We check if structure is unchanged:
-        // - If unchanged: apply fast differential updates (CPXNETchgbds + CPXNETchgobj)
-        // - If changed: rebuild entire model via CPXNETcopynet and reset basis
-        // 
-        // Only possible if MAWR_CPLEX_REUSE_MODEL=1 (persistent model enabled)
         const bool topology_unchanged =
             cplex_reuse_model_enabled &&
-            prev_augmented_node_count == static_cast<int>(augmented_num_nodes) &&
-            prev_augmented_arc_count == static_cast<int>(augmented_num_arcs) &&
+            prev_node_count == static_cast<int>(num_nodes) &&
+            prev_arc_count == static_cast<int>(num_arcs) &&
             prev_fromnode == fromnode &&
             prev_tonode == tonode;
 
         if (!topology_unchanged) {
-            // ===== REBUILD PATH: Network topology changed =====
-            // Must rebuild the entire model structure because node/arc incidence changed
-            // This indicates a significant network change (e.g., new nodes discovered)
-            clear_saved_basis();  // Basis invalid for different topology
-            
-            // Rebuild network via CPXNETcopynet with new structure and zero objectives initially
+            clear_saved_basis();
             status = CPXNETcopynet(
                 cplex_env,
                 cplex_net,
                 CPX_MIN,
-                static_cast<int>(augmented_num_nodes),
+                static_cast<int>(num_nodes),
                 supply.data(),
                 nullptr,
-                static_cast<int>(augmented_num_arcs),
+                static_cast<int>(num_arcs),
                 fromnode.data(),
                 tonode.data(),
                 low.data(),
                 up.data(),
-                zero_obj.data(),  // Start with zero objectives; real costs applied later
+                zero_obj.data(),
                 nullptr
             );
             if (status != 0) {
                 throw_cplex_error(cplex_env, status, "CPXNETcopynet");
             }
 
-            // Update topology fingerprint for next iteration's detection
-            prev_augmented_node_count = static_cast<int>(augmented_num_nodes);
-            prev_augmented_arc_count = static_cast<int>(augmented_num_arcs);
+            prev_node_count = static_cast<int>(num_nodes);
+            prev_arc_count = static_cast<int>(num_arcs);
             prev_fromnode = fromnode;
             prev_tonode = tonode;
             if (verbose) {
                 std::cout << "[CPLEX] Rebuilt network model (topology changed)." << std::endl;
             }
         } else {
-            // ===== DIFFERENTIAL UPDATE PATH: Network topology unchanged =====
-            // Structure is identical to previous iteration; apply fast incremental updates
-            // This is a warm-start optimization: reuse model structure, only update data
-            
-            // Step 1: Update arc bounds (lower and upper bounds via CPXNETchgbds)
-            // Prepare pairs of (arc_index, bound_type, new_value) for all arcs
-            // Each arc has 2 entries: one for lower bound ('L') and one for upper bound ('U')
-            std::vector<int> arc_idx_2x(static_cast<size_t>(2 * augmented_num_arcs), 0);
-            std::vector<char> lu(static_cast<size_t>(2 * augmented_num_arcs), 'L');
-            std::vector<double> bd(static_cast<size_t>(2 * augmented_num_arcs), 0.0);
-            for (ArcIndex a = 0; a < augmented_num_arcs; ++a) {
+            std::vector<int> arc_idx_2x(static_cast<size_t>(2 * num_arcs), 0);
+            std::vector<char> lu(static_cast<size_t>(2 * num_arcs), 'L');
+            std::vector<double> bd(static_cast<size_t>(2 * num_arcs), 0.0);
+            for (ArcIndex a = 0; a < num_arcs; ++a) {
                 const int ia = static_cast<int>(a);
-                // Lower bound entry
                 arc_idx_2x[static_cast<size_t>(a)] = ia;
                 lu[static_cast<size_t>(a)] = 'L';
                 bd[static_cast<size_t>(a)] = low[static_cast<size_t>(a)];
-                // Upper bound entry (offset by augmented_num_arcs)
-                arc_idx_2x[static_cast<size_t>(a + augmented_num_arcs)] = ia;
-                lu[static_cast<size_t>(a + augmented_num_arcs)] = 'U';
-                bd[static_cast<size_t>(a + augmented_num_arcs)] = up[static_cast<size_t>(a)];
+                arc_idx_2x[static_cast<size_t>(a + num_arcs)] = ia;
+                lu[static_cast<size_t>(a + num_arcs)] = 'U';
+                bd[static_cast<size_t>(a + num_arcs)] = up[static_cast<size_t>(a)];
             }
 
-            // Apply all bound changes in one call
             status = CPXNETchgbds(
                 cplex_env,
                 cplex_net,
-                static_cast<int>(2 * augmented_num_arcs),
+                static_cast<int>(2 * num_arcs),
                 arc_idx_2x.data(),
                 lu.data(),
                 bd.data()
@@ -269,17 +190,15 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
                 throw_cplex_error(cplex_env, status, "CPXNETchgbds");
             }
 
-            // Step 2: Update arc objectives (costs via CPXNETchgobj)
-            // Currently setting all to zero; will be updated to real costs before solving
-            std::vector<int> arc_idx(static_cast<size_t>(augmented_num_arcs), 0);
-            for (ArcIndex a = 0; a < augmented_num_arcs; ++a) {
+            std::vector<int> arc_idx(static_cast<size_t>(num_arcs), 0);
+            for (ArcIndex a = 0; a < num_arcs; ++a) {
                 arc_idx[static_cast<size_t>(a)] = static_cast<int>(a);
             }
 
             status = CPXNETchgobj(
                 cplex_env,
                 cplex_net,
-                static_cast<int>(augmented_num_arcs),
+                static_cast<int>(num_arcs),
                 arc_idx.data(),
                 zero_obj.data()
             );
@@ -292,23 +211,14 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
             }
         }
 
-        // ===== WARM-START BASIS INJECTION =====
-        // If enabled (MAWR_CPLEX_WARM_START=1) and compatible basis available,
-        // inject saved basis before solving. This gives simplex a head-start.
-        // Basis validity check:
-        // 1. cplex_warm_start_enabled flag is true
-        // 2. Saved basis dimensions match current network
-        // 3. Basis arrays are non-empty
         const bool can_warm_start =
             cplex_warm_start_enabled &&
-            saved_basis_arc_count == static_cast<int>(augmented_num_arcs) &&
-            saved_basis_node_count == static_cast<int>(augmented_num_nodes) &&
+            saved_basis_arc_count == static_cast<int>(num_arcs) &&
+            saved_basis_node_count == static_cast<int>(num_nodes) &&
             static_cast<int>(saved_arc_basis.size()) == saved_basis_arc_count &&
             static_cast<int>(saved_node_basis.size()) == saved_basis_node_count;
 
         if (can_warm_start) {
-            // Inject saved basis: CPXNETcopybase loads arc and node status arrays
-            // These contain CPX status codes (basis: lower/upper/free/basic)
             status = CPXNETcopybase(
                 cplex_env,
                 cplex_net,
@@ -316,7 +226,7 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
                 saved_node_basis.data()
             );
             if (status != 0) {
-                // Basis injection failed; discard and fall back to cold-start
+                // Basis injection failed, need to discard and fall back to cold-start
                 clear_saved_basis();
                 if (verbose) {
                     std::cout << "[CPLEX] Warm start basis rejected; fallback to cold start." << std::endl;
@@ -328,9 +238,6 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
             std::cout << "[CPLEX] No reusable basis available; cold start." << std::endl;
         }
 
-        // -----------------------------------------------------------------
-        // Stage 1: Feasibility solve
-        // -----------------------------------------------------------------
         status = CPXNETprimopt(cplex_env, cplex_net);
         if (status != 0) {
             throw_cplex_error(cplex_env, status, "CPXNETprimopt (feasibility stage)");
@@ -342,18 +249,15 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
             return INFEASIBLE;
         }
 
-        // -----------------------------------------------------------------
-        // Stage 2: Restore true costs and solve min-cost flow
-        // -----------------------------------------------------------------
-        std::vector<int> arc_index(static_cast<size_t>(augmented_num_arcs), 0);
-        for (ArcIndex a = 0; a < augmented_num_arcs; ++a) {
+        std::vector<int> arc_index(static_cast<size_t>(num_arcs), 0);
+        for (ArcIndex a = 0; a < num_arcs; ++a) {
             arc_index[static_cast<size_t>(a)] = static_cast<int>(a);
         }
 
         status = CPXNETchgobj(
             cplex_env,
             cplex_net,
-            static_cast<int>(augmented_num_arcs),
+            static_cast<int>(num_arcs),
             arc_index.data(),
             obj.data()
         );
@@ -381,17 +285,9 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
         optimal_cost = static_cast<CostValue>(std::llround(objval));
         maximum_flow = required_flow;
 
-        // ===== SAVE SIMPLEX BASIS FOR NEXT ITERATION =====
-        // After successful min-cost solve, extract and save the optimal basis
-        // This basis will be reused in next NATCBS iteration if topology unchanged
-        // Basis consists of:
-        // - saved_arc_basis[a]: status code for each arc (tells if at lower/upper bound, or basic)
-        // - saved_node_basis[n]: status code for each node (free, at lower, at upper, or basic)
-        
-        saved_arc_basis.assign(static_cast<size_t>(augmented_num_arcs), 0);
-        saved_node_basis.assign(static_cast<size_t>(augmented_num_nodes), 0);
-        
-        // Extract basis from solved model
+        saved_arc_basis.assign(static_cast<size_t>(num_arcs), 0);
+        saved_node_basis.assign(static_cast<size_t>(num_nodes), 0);
+
         status = CPXNETgetbase(
             cplex_env,
             cplex_net,
@@ -399,21 +295,18 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
             saved_node_basis.data()
         );
         if (status == 0) {
-            // Basis extraction succeeded; save dimensions for validation check in next iteration
-            saved_basis_arc_count = static_cast<int>(augmented_num_arcs);
-            saved_basis_node_count = static_cast<int>(augmented_num_nodes);
+            saved_basis_arc_count = static_cast<int>(num_arcs);
+            saved_basis_node_count = static_cast<int>(num_nodes);
         } else {
-            // Basis extraction failed; discard invalid basis
             clear_saved_basis();
         }
 
-        std::vector<double> x(static_cast<size_t>(augmented_num_arcs), 0.0);
-        status = CPXNETgetx(cplex_env, cplex_net, x.data(), 0, static_cast<int>(augmented_num_arcs) - 1);
+        std::vector<double> x(static_cast<size_t>(num_arcs), 0.0);
+        status = CPXNETgetx(cplex_env, cplex_net, x.data(), 0, static_cast<int>(num_arcs) - 1);
         if (status != 0) {
             throw_cplex_error(cplex_env, status, "CPXNETgetx");
         }
 
-        // Only original planner arcs are needed downstream.
         arc_flow.assign(static_cast<size_t>(num_arcs), 0);
         flow.clear();
 
@@ -452,8 +345,8 @@ FAgentsPlanner::Result FAgentsPlanner::solve_flow() {
         clear_saved_basis();
         prev_fromnode.clear();
         prev_tonode.clear();
-        prev_augmented_node_count = -1;
-        prev_augmented_arc_count = -1;
+        prev_node_count = -1;
+        prev_arc_count = -1;
         throw;
     }
 }

@@ -84,6 +84,14 @@ private:
     vector<std::pair<Location, Location>> map_edges;
     bool reached_all = false;
 
+    // Optional topology mode for warm-start experiments.
+    // When enabled, the time-expanded graph uses all passable map locations/edges
+    // instead of pruning by dynamic reachability.
+    bool full_topology_mode_enabled = false;
+    vector<Location> full_topology_locations;
+    vector<std::pair<Location, Location>> full_topology_edges;
+    unordered_map<Location, int> full_topology_dist_from_starts;
+
     unordered_map<ArcIndex, CostValue> orig_edge_costs;
     unordered_map<NodeIndex, NodeIndex> commit_edges_d_to_s;
     unordered_set<ArcIndex> deleted_arcs;
@@ -127,15 +135,15 @@ private:
     int saved_basis_arc_count = -1;
     int saved_basis_node_count = -1;
     
-    // Topology fingerprint: detects when network structure changes
+    // Topology fingerprint: detects when network structure changes.
     // Used for topology_unchanged check: if fromnode/tonode unchanged,
-    // can apply differential updates; otherwise must rebuild model
+    // can apply differential updates; otherwise must rebuild model.
     vector<int> prev_fromnode;
     vector<int> prev_tonode;
     
-    // Previous augmented network dimensions: used to detect topology changes
-    int prev_augmented_node_count = -1;
-    int prev_augmented_arc_count = -1;
+    // Previous network dimensions: used to detect topology changes.
+    int prev_node_count = -1;
+    int prev_arc_count = -1;
 
     // Lazy initialization: ensures CPLEX environment and network model are created
     void ensure_cplex_model();

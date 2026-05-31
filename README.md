@@ -117,6 +117,78 @@ The result table header is generated dynamically and reflects the selected CPLEX
 
 ---
 
+# Min-Flow Formulation & Full-Topology Mode
+
+## Summary of Changes
+
+Two major optimizations were implemented to improve CPLEX warm-start performance:
+
+### 1. **Min-Flow Formulation Implementation**
+
+- **File Modified:** `include/NATCBS/f_agents_planner_cplex.cpp` (lines ~100-127)
+- **Change:** Replaced the augmented-network helper-arc abstraction with direct lower bounds on move-gadget arcs
+- **Mathematical Basis:** Implements the min-flow formulation from the research paper, where positive edges are enforced via arc lower bounds instead of auxiliary helper nodes
+- **Benefit:** Cleaner network structure and less topological changes
+- **Validation:** 100% solution quality match against OR-Tools baseline (55 test scenarios, zero cost/makespan mismatches)
+- **Note:** This change alone provides minimal rebuild reduction (~0.8%) because rebuilds are driven by network topology growth, not constraints
+
+### 2. **Full-Topology Mode with Capacity-Zero**
+
+- **Environment Variable:** `MAWR_FULL_TOPOLOGY_MODE` (default: 0)
+- **Files Modified:**
+  - `include/NATCBS/f_agents_planner.hpp`: Added full-topology members and state variables
+  - `include/NATCBS/f_agents_planner_common.cpp`: Dual-path graph construction logic
+- **How It Works:**
+  1. At initialization, pre-computes reachability distances from all agent starts via BFS
+  2. Pre-builds all passable map locations as nodes upfront
+  3. Creates all candidate arcs, but sets capacity to 0 for arcs leading to locations unreachable by the required timestep
+  4. Time layers continue to grow dynamically (as planning horizon expands)
+- **Benefit:** Reduces rebuilds significantly
+  - **Before:** ~630 rebuilds per 55-scenario benchmark (topology grows as reachable set expands)
+  - **After:** ~55 rebuilds per 55-scenario benchmark (91% reduction, only initial build + a few topology completions)
+- **Trade-off:** Slightly higher memory overhead for arc capacity storage, but stable topology enables efficient warm-start basis reuse across iterations
+---
+
+## Benchmark Results
+
+### Full Warm-Start vs Full Cold (with Full-Topology Mode)
+
+```
+Configuration: MAWR_FULL_TOPOLOGY_MODE=1
+Warm-Start:   MAWR_CPLEX_WARM_START=1 MAWR_CPLEX_REUSE_MODEL=1
+Cold-Start:   MAWR_CPLEX_WARM_START=0 MAWR_CPLEX_REUSE_MODEL=0 (cold_mode=full)
+Test Set:     55 benchmark scenarios
+
+Results (warmstart_results_fullwarm_vs_fullcold.csv):
+  Warm Total Time:     14.876 sec
+  Cold Total Time:     20.486 sec
+  Speedup (Cold/Warm): 1.377x
+  Mean Per-Scenario:   1.098x
+  
+  Warm Basis Loads:    509 (reused across iterations)
+  Cold Basis Loads:    0 (never used)
+  
+  Warm Rebuilds:       55 (one per scenario + initial)
+  Cold Rebuilds:       639 (nearly every iteration)
+  
+  Warm Differential Updates: 586
+  Cold Differential Updates: 0
+```
+
+**Interpretation:**
+- Warm-start provides consistent **1.1–1.4x speedup** over full cold-start when network topology uses the same network.
+- The modest speedup (vs naïve expectation of 2–3x) is because full-topology mode already makes cold-start fast
+
+### OR-Tools vs CPLEX (with Full-Topology Mode)
+
+```bash
+bash scripts/run_bm.sh wh cplex-warm   # with MAWR_FULL_TOPOLOGY_MODE=1
+```
+
+Result: 55 scenarios, 100% cost/makespan match, CPLEX **6.986x faster** than OR-Tools.
+
+---
+
 # Warm-Start (CPLEX NATCBS Iterations)
 
 Warm-start is implemented in the CPLEX flow backend for NATCBS iterative solves.
@@ -234,47 +306,101 @@ cmake --build build_cplex -j
 
 ## Run Benchmarks
 
-Warm-start vs OR-Tools (new benchmark table with dynamic model columns):
+### OR-Tools vs CPLEX Mode Benchmark
+
+Compare OR-Tools against CPLEX under various warm-start configurations:
 
 ```bash
-bash scripts/run_bm.sh wh cplex-warm
+# Default: CPLEX with full warm-start + full-topology mode
+MAWR_FULL_TOPOLOGY_MODE=1 bash scripts/run_bm.sh wh cplex-warm
 ```
 
-Other OR-Tools vs CPLEX mode comparisons:
+Other configurations:
 
 ```bash
-bash scripts/run_bm.sh wh cplex-reuse-only
-bash scripts/run_bm.sh wh cplex-basis-only
-bash scripts/run_bm.sh wh cplex-cold
+# CPLEX with model reuse only (no basis warm-start)
+MAWR_FULL_TOPOLOGY_MODE=1 bash scripts/run_bm.sh wh cplex-reuse-only
+
+# CPLEX with basis warm-start only (model rebuilt each iteration)
+MAWR_FULL_TOPOLOGY_MODE=1 bash scripts/run_bm.sh wh cplex-basis-only
+
+# CPLEX full cold-start baseline (for comparison)
+MAWR_FULL_TOPOLOGY_MODE=1 bash scripts/run_bm.sh wh cplex-cold
+
+# Legacy mode (dynamic topology, original arc-omission strategy)
+bash scripts/run_bm.sh wh cplex-warm  # MAWR_FULL_TOPOLOGY_MODE=0 (default)
 ```
 
-Output file:
+**Output:** `benchmark_results.md` with per-scenario cost, makespan, and runtime comparison.
 
-- `benchmark_results.md`
+### Warm-Start vs Cold-Start Benchmark (CPLEX Only)
 
-Warm-start vs cold-start (CPLEX-only A/B, CSV output):
+Run warm-start vs cold-start in A/B mode with CSV output:
 
-## Run warm-start vs cold-start comparison on a sequence of scenarios:
+`reuse`: Cold-start with model reuse but no basis warm-start (CPLEX can rebuild the model incrementally)
+`full`: Truly cold—model destroyed and rebuilt every iteration, no basis injection
+**Usage:** `bash scripts/benchmark_warmstart.sh <dir> [timeout] [max_scenarios] [output.csv] [cold_mode]`
 
-bash scripts/benchmark_warmstart.sh wh
+```bash
+bash scripts/benchmark_warmstart.sh <root_dir> [timeout_sec] [max_scenarios] [output_csv] [cold_mode]
+```
 
-Example with explicit timeout, full scenario sweep, and custom output file:
+| Column | Meaning |
+|--------|---------|
+| `warm_time_sec` | Warm-start solver time (with basis injection) |
+| `cold_time_sec` | Cold-start solver time (specified by `cold_mode`) |
+| `cold_over_warm` | Speedup ratio (e.g., 1.377x = cold took 1.377x longer) |
+| `warm_basis_loads` | Number of times basis was successfully reused |
+| `warm_diff_updates` | Number of differential updates (bounds/objective only) |
+| `warm_rebuilds` | Number of full topology rebuilds in warm pipeline |
+| `warm_rebuild_ratio` | Rebuild frequency: `warm_rebuilds / total_iterations` |
+| `cold_diff_updates` | Diff updates in cold pipeline (0 for `full` mode) |
+| `cold_rebuilds` | Rebuilds in cold pipeline (usually equals total scenarios) |
 
-bash scripts/benchmark_warmstart.sh wh 60 0 warmstart_results_after_patch.csv
+**Interpretation Guide:**
 
-Optional arguments:
+- **High `cold_over_warm`** (>1.2x): Warm-start is providing significant benefit
+- **High `warm_basis_loads`**: Basis was reused frequently (topology stable)
+- **Low `warm_rebuild_ratio`** (<0.1): Most iterations used differential updates (ideal)
+- **High `warm_diff_updates`** relative to `warm_rebuilds`: Network mostly changed in arc weights/capacities, not structure
 
-bash scripts/benchmark_warmstart.sh <root_directory> [timeout_sec=60] [max_scenarios=0] [out_csv=warmstart_results.csv]
+---
 
-Output CSV columns (`warmstart_results.csv`):
+## Quick Benchmark Comparisons
 
-- `warm_time_sec`, `cold_time_sec`, `cold_over_warm`
-- `warm_basis_loads` (how often basis was reused)
-- `warm_diff_updates`, `warm_rebuilds`
-- `warm_rebuild_ratio` (proxy for magnitude of structural network changes)
+### Scenario 1: Validate Correctness (OR-Tools Baseline)
 
-Interpretation:
+```bash
+# Build both backends
+cmake -S . -B build_ortools ...
+cmake -S . -B build_cplex ...
 
-- Higher `cold_over_warm` means warm-start is helping.
-- Lower `warm_rebuild_ratio` means more iterations used differential updates and are more likely to benefit from warm-start.
+# Benchmark with full-topology mode
+MAWR_FULL_TOPOLOGY_MODE=1 bash scripts/run_bm.sh wh cplex-warm
+
+# Expected: Perfect cost and makespan match
+```
+
+### Scenario 2: Measure Warm-Start Benefit
+
+```bash
+# Warm-start vs cold-start (full rebuild baseline)
+MAWR_FULL_TOPOLOGY_MODE=1 bash scripts/benchmark_warmstart.sh wh 60 0 results.csv full
+
+# Should see cold_over_warm >= 1.1x for most scenarios
+# Larger problems typically show 1.2–1.5x benefit
+```
+
+### Scenario 3: Compare Old vs New Topology Strategy
+
+```bash
+# Legacy (dynamic topology, arc omission)
+bash scripts/benchmark_warmstart.sh wh 60 0 results_old.csv full
+
+# New (full-topology, capacity-zero)
+MAWR_FULL_TOPOLOGY_MODE=1 bash scripts/benchmark_warmstart.sh wh 60 0 results_new.csv full
+
+# New should show:
+# - Fewer rebuilds (91% reduction in warm_rebuilds + cold_rebuilds)
+# - Lower overall times
 
