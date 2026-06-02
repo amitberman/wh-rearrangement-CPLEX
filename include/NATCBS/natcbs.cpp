@@ -70,6 +70,7 @@ shared_ptr<Plan> NATCBS::solve(int time_limit, bool& time_limit_exceeded) {
         if (obs_conflict) {
             if (verbose) {
                 std::cout << "Obs conflict detected: " << *obs_conflict << std::endl;
+                std::cout << "[NATCBS] Split obstacle conflict" << std::endl;
             }
             auto children = resolve_obs_conflict(node, obs_conflict);
             if (children.first) {
@@ -106,6 +107,7 @@ shared_ptr<Plan> NATCBS::solve(int time_limit, bool& time_limit_exceeded) {
         assert(ap_result == AgentsPlanner::CONFLICT);
         if (verbose) {
             std::cout << "Realization conflict detected: " << *realization_conflict << std::endl;
+            std::cout << "[NATCBS] Split realization conflict" << std::endl;
         }
 
         auto children = resolve_realization_conflict(node, realization_conflict);
